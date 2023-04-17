@@ -26,6 +26,7 @@ import numpy as np
 import rospy
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Odometry
 from sensor_msgs.msg import LaserScan
+import math
 
 
 class Mapper:
@@ -52,9 +53,12 @@ class Mapper:
         )
         self.map.data = np.zeros(map_width * map_height, dtype=np.int8)
         self.map.data[:] = -1  # Unknown
-        self.map2d = np.zeros((map_width, map_height), dtype=np.int8)  # For computation
+        self.map2d = np.full((map_width, map_height), fill_value=-1, dtype=np.int8)  # For computation
         self.scan = None
         self.odom = None
+
+        self.x_ma = int(self.map2d.shape[1]/2)
+        self.y_ma = self.map2d.shape[0] - 1
 
     def scan_callback(self, msg):
         """Called when a new scan is available from the lidar."""
@@ -88,8 +92,21 @@ class Mapper:
                 self.map_pub.publish(self.map)
             self.rate.sleep()
 
+def transform(xr, yr, x, y, x_ma, y_ma):
+    ma = np.array([[1,  0,  0, x_ma], 
+                    [0, -1,  0, y_ma], 
+                    [0,  0, -1, 0   ], 
+                    [0,  0,  0, 1   ]])
+    
+    pr_m = np.array([xr, yr, 0, 1])
+    ps_m = np.array([ x,  y, 0, 1])
 
-def ray_to_pixels(xr, yr, x, y, map_resolution, map):
+    pr_a = np.dot(ma, pr_m)
+    ps_a = np.dot(ma, ps_m)
+
+    return pr_a, ps_a
+
+def ray_to_pixels(xr, yr, x, y, map_resolution, map, x_ma, y_ma):
     """Set the pixels along the ray with origin (xr,yr) and with range ending at (x,y) to 0 (free) and the end point to 100 (occupied).
     Arguments
     ---------
@@ -105,9 +122,58 @@ def ray_to_pixels(xr, yr, x, y, map_resolution, map):
         Resolution of map in pixels/meter
     map : ndarray
         The map as a 2d numpy array
+    x_ma : int
+        X in the map as seen in the array
+    y_ma : int
+        Y in the map as seen in the array
     """
     # --------------------------------------------------------------
     # Your code here
+    pr_a, ps_a = transform(xr, yr, x, y, x_ma, y_ma)
+    
+    x_min = min(pr_a[0], ps_a[0])
+    x_max = max(pr_a[0], ps_a[0])
+    y_min = min(pr_a[1], ps_a[1])
+    y_max = max(pr_a[1], ps_a[1])
+
+    if x_min < 0:
+        x_add = np.full((map.shape[0], -(x_min)), fill_value=-1, dtype=np.int8)
+        map = np.concatenate((x_add, map), axis = 1)
+        x_ma = x_ma - x_min
+
+    if y_min < 0:
+        y_add = np.full((-(y_min), map.shape[1]), fill_value=-1, dtype=np.int8)
+        map = np.concatenate((y_add, map), axis = 0)
+        y_ma = y_ma - y_min
+
+    if x_max >= map.shape[1]:
+        x_add = np.full((map.shape[0], x_max - map.shape[1]), fill_value=-1, dtype=np.int8)
+        map = np.concatenate((map, x_add), axis = 1)
+
+    if y_max >= map.shape[1]:
+        y_add = np.full((y_max - map.shape[0], map.shape[1]), fill_value=-1, dtype=np.int8)
+        map = np.concatenate((map, y_add), axis = 0)
+    
+    pr_a, ps_a = transform(xr, yr, x, y, x_ma, y_ma)
+
+    m = (pr_a[1] - ps_a[1]) / (pr_a[0] - ps_a[0])
+
+    x_i = pr_a[0]
+    y_i = pr_a[0]
+
+    i = 0
+
+    map[ps_a[0]][ps_a[1]] = 100
+
+    while x_i != ps_a[1]:
+        x_i += i
+        yc = math.ciel(x_i * m)
+        yf = math.floor(x_i * m)
+
+        map[x_i][yc] = 0
+        map[x_i][yf] = 0
+
+
     # --------------------------------------------------------------
     # --------------------------------------------------------------
 
@@ -134,18 +200,23 @@ def scan_to_map_coordinates(scan, odom):
     >>> orig, xy = scan_to_map_coordinates(scan, odom)
     >>> np.allclose(orig, (1.0, 2.0))
     True
-    >>> np.allclose(xy,[(0.0, 2.0), (1.0, 4.0), (2.0, 1.0)])
+    >>> np.allclose(xy,[(2.0, 2.0), (1.0, 3.0), (0.0, 2.0)])
     True
     """
 
     robot_origin = odom.pose.pose.position
     xr = robot_origin.x
     yr = robot_origin.y
+    thr = 2 * np.arccos(odom.pose.pose.orientation.w)
     xy = []
     for i in range(len(scan.ranges)):
-        th = scan.angle_min + i * scan.angle_increment
+        th = scan.angle_min + i * scan.angle_increment + thr
         r = scan.ranges[i]
         x, y = polar_to_cartesian(r, th)
+
+        x += xr
+        y += yr
+
         xy.append((x, y))
     return (xr, yr), xy
 
